@@ -6,14 +6,11 @@ import threading
 import json
 import queue
 import logging
-import signal
 import requests
 import win32gui
-import win32con
 import win32event
 import win32api
 import winerror
-import ctypes
 import psutil
 import subprocess
 import win32crypt
